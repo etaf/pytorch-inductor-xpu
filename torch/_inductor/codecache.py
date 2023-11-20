@@ -35,7 +35,11 @@ from typing import Any, Callable, Dict, List, Set, Union
 
 import torch
 
-from torch._inductor import config, cuda_properties, exc
+from torch._dynamo.device_interface import (
+    get_interface_for_device,
+    get_registered_device_interfaces,
+)
+from torch._inductor import config, exc
 from torch._inductor.utils import developer_warning
 from torch.hub import _Faketqdm, tqdm
 
@@ -1250,8 +1254,17 @@ class TritonCodeCache:
         return getattr(mod, kernel_name)
 
 
-def _worker_compile(kernel_name, source_code, cc, device):
-    cuda_properties.set_compiler_worker_current_device(device)
+def caching_device_properties():
+    for _, device_interface in get_registered_device_interfaces():
+        if device_interface.is_available():
+            device_interface.Worker.get_device_properties()
+
+
+def _worker_compile(
+    kernel_name: str, source_code: str, cc: int, device: torch.device
+) -> None:
+    device_interface = get_interface_for_device(device.type)
+    device_interface.Worker.set_device(device.index)
     kernel = TritonCodeCache.load(kernel_name, source_code)
     kernel.precompile(warm_cache_only_with_cc=cc)
 
@@ -1301,7 +1314,7 @@ class AsyncCompile:
     def process_pool():
         # ensure properties have been calculated before processes
         # are forked
-        cuda_properties._properties()
+        caching_device_properties()
         assert config.compile_threads > 1
         orig_ppid = os.getpid()
 
@@ -1376,13 +1389,13 @@ class AsyncCompile:
             return list(map(fn, seq))
         return [t.result() for t in [cls.pool().submit(fn, x) for x in seq]]
 
-    def triton(self, kernel_name, source_code):
+    def triton(self, kernel_name, source_code, device: str = "cuda"):
         _compile_start()
 
         if config.compile_threads > 1:
-            major, minor = torch.cuda.get_device_capability()
-            device = torch.cuda.current_device()
-            cc = major * 10 + minor
+            device_interface = get_interface_for_device(device)
+            device = torch.device(device, device_interface.current_device())
+            cc = device_interface.get_compute_capability(device)
             future = self.process_pool().submit(
                 _worker_compile, kernel_name, source_code, cc, device
             )

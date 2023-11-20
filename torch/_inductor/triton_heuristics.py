@@ -16,6 +16,7 @@ from typing import Any, Callable, List, Optional, Set, Tuple
 import torch
 
 import torch.autograd.profiler as autograd_profiler
+from torch._dynamo.device_interface import get_interface_for_device
 from torch._dynamo.utils import dynamo_timed
 
 from . import config
@@ -29,6 +30,7 @@ from .utils import (
     create_bandwidth_info_str,
     do_bench,
     get_num_bytes,
+    has_triton_package,
     has_triton,
     next_power_of_2,
     triton_config_to_hashable,
@@ -37,15 +39,19 @@ from .utils import (
 
 log = logging.getLogger(__name__)
 
-if has_triton():
+if has_triton_package():
     import triton
     from triton import Config
-    from triton.runtime.jit import get_cuda_stream, KernelInterface
+    from triton.runtime.jit import KernelInterface
 else:
     Config = object
-    get_cuda_stream = None
-    KernelInterface = object
     triton = None
+    KernelInterface = object
+
+if has_triton():
+    from triton.runtime.jit import get_cuda_stream
+else:
+    get_cuda_stream = None
 
 
 class HeuristicType(Enum):

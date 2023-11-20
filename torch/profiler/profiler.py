@@ -51,7 +51,8 @@ class _KinetoProfile:
 
     Args:
         activities (iterable): list of activity groups (CPU, CUDA) to use in profiling, supported values:
-            ``torch.profiler.ProfilerActivity.CPU``, ``torch.profiler.ProfilerActivity.CUDA``.
+            ``torch.profiler.ProfilerActivity.CPU``, ``torch.profiler.ProfilerActivity.CUDA``,
+            ``torch.profiler.ProfilerActivity.XPU``.
             Default value: ProfilerActivity.CPU and (when available) ProfilerActivity.CUDA.
         record_shapes (bool): save information about operator's input shapes.
         profile_memory (bool): track tensor memory allocation/deallocation.
@@ -112,6 +113,7 @@ class _KinetoProfile:
     def prepare_trace(self):
         self.profiler = prof.profile(
             use_cuda=(ProfilerActivity.CUDA in self.activities),
+            use_xpu=(ProfilerActivity.XPU in self.activities),
             use_cpu=(ProfilerActivity.CPU in self.activities),
             use_mtia=(ProfilerActivity.MTIA in self.activities),
             use_device=None,
@@ -261,11 +263,14 @@ class _KinetoProfile:
         Output: File written as JSON or gzipped JSON
         """
         # Default to device 0, if unset. Fallback on cpu.
-        if device is None and self.use_device and self.use_device != "cuda":
+        if device is None and self.use_device and self.use_device not in ["cuda", "xpu"]:
             device = self.use_device + ":0"
 
         if device is None:
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            if hasattr(torch, 'xpu') and torch.xpu.is_available():  # type: ignore[attr-defined]
+                device = "xpu:0"
+            else:
+                device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
         # Construct the memory timeline plot data
         self.mem_tl = MemoryProfileTimeline(self._memory_profile())
@@ -384,7 +389,8 @@ class profile(_KinetoProfile):
 
     Args:
         activities (iterable): list of activity groups (CPU, CUDA) to use in profiling, supported values:
-            ``torch.profiler.ProfilerActivity.CPU``, ``torch.profiler.ProfilerActivity.CUDA``.
+            ``torch.profiler.ProfilerActivity.CPU``, ``torch.profiler.ProfilerActivity.CUDA``,
+            ``torch.profiler.ProfilerActivity.XPU``.
             Default value: ProfilerActivity.CPU and (when available) ProfilerActivity.CUDA.
         schedule (Callable): callable that takes step (int) as a single parameter and returns
             ``ProfilerAction`` value that specifies the profiler action to perform at each step.

@@ -526,6 +526,21 @@ int64_t _fused_sdp_choice_meta(
         scale);
     return choice_int;
   }
+
+  bool has_xpu = query_key_set.has(c10::DispatchKey::XPU);
+  if (has_xpu) {
+    auto choice_int = at::_ops::_fused_sdp_choice::redispatch(
+        c10::DispatchKeySet(c10::DispatchKey::XPU),
+        query_,
+        key,
+        value,
+        attn_mask_,
+        dropout_p,
+        is_causal,
+        scale);
+    return choice_int;
+  }
+
   return static_cast<int64_t>(sdp::SDPBackend::math);
 }
 namespace {
@@ -679,6 +694,8 @@ Tensor scaled_dot_product_attention(
       || query_.device().type() == DeviceType::CPU){
     choice_int = _fused_sdp_choice_stub(query_.device().type(),
       query_, key, value, attn_mask_, dropout_p, is_causal, scale);
+  } else if (query_.device().type() == DeviceType::XPU) {
+    choice_int = _fused_sdp_choice_meta(query_, key, value, attn_mask_, dropout_p, is_causal, scale);
   }
   sdp::SDPBackend backend = static_cast<sdp::SDPBackend>(choice_int);
   c10::optional<Tensor> attn_mask = convert_boolean_attn_mask(attn_mask_, query_.dtype());

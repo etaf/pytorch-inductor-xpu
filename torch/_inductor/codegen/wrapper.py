@@ -304,8 +304,8 @@ class WrapperCodeGen(CodeGen):
         # maps from reusing buffer to reused buffer
         self.reuses = dict()
 
-        self.write_get_cuda_stream = functools.lru_cache(None)(  # type: ignore[assignment]
-            self.write_get_cuda_stream
+        self.write_get_raw_stream = functools.lru_cache(None)(  # type: ignore[assignment]
+            self.write_get_raw_stream
         )
 
         @functools.lru_cache(None)
@@ -404,7 +404,7 @@ class WrapperCodeGen(CodeGen):
             if config.size_asserts:
                 self.codegen_input_size_asserts()
 
-    def write_get_cuda_stream(self, index):
+    def write_get_raw_stream(self, index):
         self.write_triton_header_once()
         name = f"stream{index}"
         self.writeline(f"{name} = get_cuda_stream({index})")
@@ -729,7 +729,7 @@ class WrapperCodeGen(CodeGen):
         if cuda:
             call_args_str = ", ".join(pexpr(item) for item in call_args)
             grid_str = ", ".join(pexpr(item) for item in grid)
-            stream_name = self.write_get_cuda_stream(
+            stream_name = self.write_get_raw_stream(
                 V.graph.scheduler.current_device.index
             )
             self.writeline(
@@ -1409,7 +1409,7 @@ class CudaWrapperCodeGen(CppWrapperCodeGen):
             """
         )
 
-    def write_get_cuda_stream(self, index):
+    def write_get_raw_stream(self, index):
         name = f"stream{index}"
         self.writeline(
             f"cudaStream_t {name} = at::cuda::getCurrentCUDAStream({index});"
@@ -1489,7 +1489,7 @@ class CudaWrapperCodeGen(CppWrapperCodeGen):
         kernel_args_var = f"kernel_args_var_{next(self.kernel_callsite_id)}"
         self.writeline(f"void* {kernel_args_var}[] = {{{call_args}}};")
         stream = (
-            "stream" if V.graph.aot_mode else self.write_get_cuda_stream(device_index)
+            "stream" if V.graph.aot_mode else self.write_get_raw_stream(device_index)
         )
         self.writeline(
             "launchKernel({}, {}, {}, {}, {}, {}, {}, {});".format(

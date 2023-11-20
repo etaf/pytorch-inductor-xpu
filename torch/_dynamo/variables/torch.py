@@ -1,10 +1,13 @@
 import collections
+import inspect
 import logging
 
 import math
 import re
 import types
 from typing import Dict, List
+
+from torch._streambase import _StreamBase
 
 try:
     import numpy as np
@@ -19,6 +22,7 @@ from torch._dynamo.variables import UserFunctionVariable
 
 from .. import config, variables
 from ..allowed_functions import torch_get_name
+from ..device_interface import device_interfaces
 from ..exc import unimplemented
 from ..source import GeneratorStateSource
 from ..utils import (
@@ -210,11 +214,11 @@ class TorchVariable(VariableTracker):
     ) -> "VariableTracker":
         from . import (
             ConstantVariable,
-            CUDAStreamContextVariable,
-            CUDAStreamVariable,
             DeterministicAlgorithmsVariable,
             DisabledSavedTensorsHooksVariable,
             GradModeVariable,
+            StreamContextVariable,
+            StreamVariable,
             SymNodeVariable,
             TensorVariable,
             UserDefinedObjectVariable,
@@ -337,19 +341,21 @@ class TorchVariable(VariableTracker):
         elif self.value is torch._C.DisableTorchFunctionSubclass:
             assert not (args or kwargs)
             return TorchFunctionDisableVariable.create(tx, **options)
-        elif self.value is torch.cuda.stream:
-            log.warning(
-                "torch.cuda.stream() not fully supported, streams may be ignored"
-            )
+        elif any(
+            self.value is method
+            for method in [
+                interface_elem.stream for interface_elem in device_interfaces.values()
+            ]
+        ):
             assert len(args) == 1
-            return CUDAStreamContextVariable.create(tx, args[0], **options)
-        elif self.value is torch.cuda.streams.Stream:
+            return StreamContextVariable.create(tx, args[0], **options)
+        elif inspect.isclass(self.value) and issubclass(self.value, _StreamBase):
             return wrap_fx_proxy_cls(
-                CUDAStreamVariable,
+                StreamVariable,
                 tx,
                 tx.output.create_proxy(
                     "call_function",
-                    torch.cuda.streams.Stream,
+                    self.value,
                     (),
                     {},
                 ),

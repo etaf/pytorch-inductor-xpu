@@ -31,8 +31,10 @@ class profile:
         enabled=True,
         *,
         use_cuda=False,
+        use_xpu=False,
         record_shapes=False,
         with_flops=False,
+        with_calling_stack=False,
         profile_memory=False,
         with_stack=False,
         with_modules=False,
@@ -41,10 +43,12 @@ class profile:
         if not self.enabled:
             return
         self.use_cuda = use_cuda
+        self.use_xpu = use_xpu
         self.function_events = None
         self.entered = False
         self.record_shapes = record_shapes
         self.with_flops = with_flops
+        self.with_calling_stack = with_calling_stack
         self.record_shapes |= self.with_flops
         self.profile_memory = profile_memory
         self.with_stack = with_stack
@@ -54,8 +58,14 @@ class profile:
             warn("CUDA is not available, disabling CUDA profiling")
             self.use_cuda = False
 
+        if self.use_xpu and not (hasattr(torch, "xpu") and torch.xpu.is_available()):   # type: ignore[attr-defined]
+            warn("XPU is not available, disabling XPU profiling")
+            self.use_xpu = False
+
         if self.use_cuda:
             self.profiler_kind = ProfilerState.CUDA
+        elif self.use_xpu:
+            self.profiler_kind = ProfilerState.XPU
         else:
             self.profiler_kind = ProfilerState.CPU
 
@@ -88,14 +98,18 @@ class profile:
             return
         if self.use_cuda:
             torch.cuda.synchronize()
+        if self.use_xpu:
+            torch.xpu.synchronize()     # type: ignore[attr-defined]
 
         records = _disable_profiler_legacy()
         parsed_results = _parse_legacy_records(records)
         self.function_events = EventList(
             parsed_results,
             use_cuda=self.use_cuda,
+            use_xpu=self.use_xpu,
             profile_memory=self.profile_memory,
             with_flops=self.with_flops,
+            with_calling_stack=self.with_calling_stack
         )
         self.function_events._build_tree()
         return False
@@ -121,6 +135,7 @@ class profile:
         max_src_column_width=75,
         max_name_column_width=55,
         max_shapes_column_width=80,
+        max_depth=10,
         header=None,
         top_level_events_only=False,
     ):
@@ -132,6 +147,7 @@ class profile:
             max_src_column_width=max_src_column_width,
             max_name_column_width=max_name_column_width,
             max_shapes_column_width=max_shapes_column_width,
+            max_depth=max_depth,
             header=header,
             top_level_events_only=top_level_events_only,
         )
@@ -200,8 +216,12 @@ def _parse_legacy_records(thread_records):
         # accumulated memory allocations per handle
         cpu_memory_allocs = {}
         cuda_memory_allocs = {}
+        xpu_memory_allocs = {}
         # ranges per handle
         range_starts = {}
+        function_stack = []
+        calling_stack = []
+        calling_id = 0
 
         filtered_handles = set()
         prev_record = None
@@ -224,19 +244,38 @@ def _parse_legacy_records(thread_records):
                         filtered_handles.add(record_key)
                         continue
 
-                range_starts[record_key] = record
+                calling_stack.append(calling_id + 1)
+                calling_id = 0
+                # create the function event for appending kernel
+                fe = FunctionEvent(
+                    id=record.handle(),
+                    node_id=record.node_id(),
+                    name=_rewrite_name(name=record.name(), with_wildcard=True),
+                    thread=record.thread_id(),
+                    start_us=0,
+                    end_us=0,
+                    stack=[],
+                    cstack=tuple(calling_stack),
+                    input_shapes=record.shapes(),
+                    device_type=DeviceType.CPU,
+                    is_legacy=True)
+                function_stack.append(fe)
+                range_starts[record_key] = (record, fe)
                 cpu_memory_allocs[record_key] = 0
                 cuda_memory_allocs[record_key] = 0
+                xpu_memory_allocs[record_key] = 0
             elif record.kind() == "pop":
                 assert (
                     record_key in range_starts
                 ), f"""Expected record with key {record_key} to exist in range_starts.
                     This means that the pop event did not have a corresponding push."""
 
-                start = range_starts[record_key]
+                start, cached_fe = range_starts[record_key]
+                calling_id = calling_stack.pop()
 
                 cpu_memory_usage = cpu_memory_allocs[record_key]
                 cuda_memory_usage = cuda_memory_allocs[record_key]
+                xpu_memory_usage = xpu_memory_allocs[record_key]
                 is_async = start.is_async() or (start.thread_id() != record.thread_id())
                 is_remote_event = record.is_remote()
                 start_flops = start.flops()
@@ -254,9 +293,11 @@ def _parse_legacy_records(thread_records):
                     stack=[
                         entry for entry in start.stack() if _filter_stack_entry(entry)
                     ],
+                    cstack=cached_fe.cstack,
                     scope=start.scope(),
                     cpu_memory_usage=cpu_memory_usage,
                     cuda_memory_usage=cuda_memory_usage,
+                    xpu_memory_usage=xpu_memory_usage,
                     is_async=is_async,
                     is_remote=is_remote_event,
                     sequence_nr=start.sequence_nr(),
@@ -264,15 +305,19 @@ def _parse_legacy_records(thread_records):
                     is_legacy=True,
                     flops=start_flops,
                 )
+                fe.kernels = cached_fe.kernels
+
                 # note: async events have only cpu total time
                 if not is_async and start.has_cuda():
                     duration = start.cuda_elapsed_us(record)
                     if duration > 0:
-                        fe.append_kernel(start.name(), start.device(), duration)
+                        fe.append_kernel(start.name(), start.device(), "cuda", duration)
                 functions.append(fe)
+                function_stack.remove(cached_fe)
                 del range_starts[record_key]
                 del cpu_memory_allocs[record_key]
                 del cuda_memory_allocs[record_key]
+                del xpu_memory_allocs[record_key]
             elif record.kind() == "memory_alloc":
                 num_open_handles_cpu = len(cpu_memory_allocs)
                 num_open_handles_cuda = len(cuda_memory_allocs)
@@ -281,6 +326,8 @@ def _parse_legacy_records(thread_records):
                     cpu_memory_allocs[handle] += record.cpu_memory_usage()
                 for handle in cuda_memory_allocs.keys():
                     cuda_memory_allocs[handle] += record.cuda_memory_usage()
+                for handle in xpu_memory_allocs.keys():
+                    xpu_memory_allocs[handle] += record.xpu_memory_usage()
                 if num_open_handles_cpu == 0:
                     # output event as a top-level memory event
                     fe = FunctionEvent(
@@ -296,6 +343,30 @@ def _parse_legacy_records(thread_records):
                         is_legacy=True,
                     )
                     functions.append(fe)
+            elif record.kind() == "mark":
+                if "__xpu_start_event" in record.name():
+                    continue
+                if record.has_xpu():
+                    if len(function_stack) > 0:
+                        fe = function_stack[-1]
+                        fe.append_kernel(fe.name + "(" + record.name() + ")",
+                                         0, "xpu", record.xpu_elapsed_us())
+                    else:
+                        # An xpu event is recorded but no parent function was recorded.
+                        fe = FunctionEvent(
+                            id=record.handle(),
+                            node_id=record.node_id(),
+                            name=_rewrite_name(name=record.name(), with_wildcard=True),
+                            thread=record.thread_id(),
+                            start_us=0,
+                            end_us=0,
+                            stack=[],
+                            cstack=tuple(calling_stack),
+                            input_shapes=record.shapes(),
+                            is_legacy=True)
+                        fe.append_kernel(fe.name + "(" + record.name() + ")",
+                                         0, "xpu", record.xpu_elapsed_us())
+                        functions.append(fe)
             prev_record = record
 
     # Sort functions by start time then by end time ascending.

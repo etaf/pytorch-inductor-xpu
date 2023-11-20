@@ -61,8 +61,7 @@ static_assert(
 
 static Backend default_backend = Backend::CPU;
 
-static void py_bind_tensor_types(
-    const std::vector<PyTensorType*>& tensor_types);
+static void py_bind_tensor_type(const PyTensorType& tensor_types);
 
 static TypeError unavailable_type(const PyTensorType& type) {
   return TypeError(
@@ -218,33 +217,47 @@ static void py_initialize_tensor_type(
   }
 }
 
-static const char* get_module(Backend backend) {
-  switch (backend) {
-    case Backend::CPU:
-      return "torch";
-    case Backend::CUDA:
-      return "torch.cuda";
-    case Backend::SparseCPU:
-      return "torch.sparse";
-    case Backend::SparseCUDA:
-      return "torch.cuda.sparse";
-    default:
-      AT_ERROR("invalid backend: ", toString(backend));
-  }
-}
-
 static std::string get_name(Backend backend, ScalarType scalarType) {
   std::ostringstream ss;
-  ss << get_module(backend) << "." << toString(scalarType) << "Tensor";
+  ss << torch::utils::backend_to_string(backend) << "." << toString(scalarType) << "Tensor";
   return ss.str();
 }
 
-static THPObjectPtr get_storage_obj(Backend backend, ScalarType dtype) {
-  auto module_name = get_module(backend);
-  auto module_obj = THPObjectPtr(PyImport_ImportModule(module_name));
-  if (!module_obj)
-    throw python_error();
+static THPObjectPtr get_py_module(c10::Backend backend) {
+  auto torch_module = THPObjectPtr(PyImport_ImportModule("torch"));
+  if (!torch_module) throw python_error();
 
+  auto module_name = torch::utils::backend_to_string(backend);
+  auto module_obj = THPObjectPtr(PyImport_ImportModule(module_name));
+  if (!module_obj) {
+    std::string name(module_name);
+    auto module_idx = name.find('.');
+    if (module_idx != std::string::npos) {
+      auto module_name = name.substr(module_idx + 1);
+      module_obj = THPObjectPtr(PyObject_GetAttrString(torch_module.get(), module_name.c_str()));
+      if (!module_obj) throw python_error();
+    }
+    else {
+      throw python_error();
+    }
+  }
+  return module_obj;
+}
+
+static std::vector<std::unique_ptr<PyTensorType>> tensor_types;
+
+static PyTensorType* get_tensor_type(c10::Backend backend, c10::ScalarType scalar_type) {
+  auto it = std::find_if(tensor_types.begin(), tensor_types.end(),
+                         [backend, scalar_type](const std::unique_ptr<PyTensorType>& x) {
+                             return x->get_backend() == backend && x->get_scalar_type() == scalar_type;
+                         });
+  if (it != tensor_types.end())
+    return (*it).get();
+  return nullptr;
+}
+
+static THPObjectPtr get_storage_obj(Backend backend, ScalarType dtype) {
+  auto module_obj = get_py_module(backend);
   auto storage_name = std::string(toString(dtype)) + "Storage";
   THPObjectPtr storage(
       PyObject_GetAttrString(module_obj.get(), storage_name.c_str()));
@@ -301,25 +314,7 @@ static THPObjectPtr get_tensor_dict() {
   return res;
 }
 
-// A note about the lifetime of the various PyTensorType: normally
-// PyTypeObject instances are statically allocated, but we want to create them
-// dynamically at init time, because their exact number depends on
-// torch::utils::all_declared_types(). The memory for each PyTensorType is
-// allocated by initialize_aten_types() and never freed: technically it's a
-// leak, but it's not a problem since we want them to be alive for the whole
-// time of the process anyway.
-//
-// An alternative is to use a std::vector<PyTensorType> instead, and let
-// std::vector to manage the lifetime of its items. This is problematic
-// though, because it means that the memory of PyTensorType is deallocated at
-// some point during the exit: if by chance we have another global destructor
-// and/or atexit() function which tries to access the PyTensorTypes, we risk
-// an use-after-free error. This happens for example if we embed CPython and
-// call Py_Finalize inside an atexit() function which was registered before
-// importing torch.
-static std::vector<PyTensorType*> tensor_types;
-
-static void set_default_storage_type(Backend backend, ScalarType dtype) {
+void set_default_storage_type(Backend backend, ScalarType dtype) {
   THPObjectPtr storage = get_storage_obj(backend, dtype);
 
   auto torch_module = THPObjectPtr(PyImport_ImportModule("torch"));
@@ -361,13 +356,13 @@ static void set_default_tensor_type(
   }
 }
 
-static void initialize_aten_types(std::vector<PyTensorType*>& tensor_types) {
+static void initialize_aten_types(std::vector<std::unique_ptr<PyTensorType>>& tensor_types) {
   // includes CUDA types even when PyTorch is not built with CUDA
   auto declared_types = torch::utils::all_declared_types();
   tensor_types.resize(declared_types.size());
 
   for (size_t i = 0, end = declared_types.size(); i != end; i++) {
-    tensor_types[i] = new PyTensorType();
+    tensor_types[i] = std::make_unique<PyTensorType>();
     auto& tensor_type = *tensor_types[i];
     Backend backend = declared_types[i].first;
     ScalarType scalar_type = declared_types[i].second;
@@ -403,46 +398,59 @@ void initialize_python_bindings() {
   // Add the type objects to their corresponding modules. e.g. torch.FloatTensor
   // is added to the `torch` module as `FloatTensor`. Also add all the type
   // objects to the set torch._tensor_classes.
-  py_bind_tensor_types(tensor_types);
+  for (auto& tensor_type : tensor_types) {
+    py_bind_tensor_type(*tensor_type);
+  }
 }
 
-static void py_bind_tensor_types(
-    const std::vector<PyTensorType*>& tensor_types) {
+PyObject* register_python_tensor_type(Backend backend, ScalarType scalar_type) {
+  PyTensorType* registed_tensor_type = get_tensor_type(backend, scalar_type);
+  if (registed_tensor_type)
+    return (PyObject*)registed_tensor_type;
+
+  std::unique_ptr<PyTensorType> new_tensor_type = std::make_unique<PyTensorType>();
+
+  set_type(*new_tensor_type, backend, scalar_type);
+  set_name(*new_tensor_type, get_name(backend, scalar_type));
+
+  auto tensor_dict = get_tensor_dict();
+
+  py_initialize_tensor_type(new_tensor_type->py_type, new_tensor_type->name, tensor_dict.get());
+
+  py_bind_tensor_type(*new_tensor_type);
+
+  PyTensorType* ret = new_tensor_type.get();
+  tensor_types.push_back(std::move(new_tensor_type));
+  return (PyObject*)ret;
+}
+
+static void py_bind_tensor_type(const PyTensorType& tensor_type) {
   auto torch_module = THPObjectPtr(PyImport_ImportModule("torch"));
-  if (!torch_module)
+  if (!torch_module) throw python_error();
+
+  auto tensor_classes = THPObjectPtr(PyObject_GetAttrString(torch_module.get(), "_tensor_classes"));
+  if (!tensor_classes) throw python_error();
+
+  auto name = std::string(tensor_type.name);
+  auto idx = name.rfind('.');
+  auto type_name = name.substr(idx + 1);
+  auto module_obj = get_py_module(tensor_type.get_backend());
+
+  PyObject* type_obj = (PyObject*)&tensor_type;
+  Py_INCREF(type_obj);
+  if (PyModule_AddObject(module_obj.get(), type_name.c_str(), type_obj) < 0) {
     throw python_error();
-
-  auto tensor_classes = THPObjectPtr(
-      PyObject_GetAttrString(torch_module.get(), "_tensor_classes"));
-  if (!tensor_classes)
+  }
+  if (PySet_Add(tensor_classes.get(), type_obj) < 0) {
     throw python_error();
-
-  for (auto& tensor_type : tensor_types) {
-    auto name = std::string(tensor_type->name);
-    auto idx = name.rfind('.');
-    auto type_name = name.substr(idx + 1);
-    auto module_name = name.substr(0, idx);
-
-    auto module_obj = THPObjectPtr(PyImport_ImportModule(module_name.c_str()));
-    if (!module_obj)
-      throw python_error();
-
-    PyObject* type_obj = (PyObject*)tensor_type;
-    Py_INCREF(type_obj);
-    if (PyModule_AddObject(module_obj.get(), type_name.c_str(), type_obj) < 0) {
-      throw python_error();
-    }
-    if (PySet_Add(tensor_classes.get(), type_obj) < 0) {
-      throw python_error();
-    }
   }
 }
 
 static bool PyTensorType_Check(PyObject* obj) {
-  auto it = std::find_if(
-      tensor_types.begin(), tensor_types.end(), [obj](PyTensorType* x) {
-        return (PyObject*)x == obj;
-      });
+  auto it = std::find_if(tensor_types.begin(), tensor_types.end(),
+    [obj](const std::unique_ptr<PyTensorType>& x) {
+      return (PyObject*)(x.get()) == obj;
+    });
   return it != tensor_types.end();
 }
 
