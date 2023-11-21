@@ -4770,3 +4770,6 @@ import_submodule(kernel)
 from . import quantized_lowerings
 
 quantized_lowerings.register_quantized_ops()
+
+if torch.xpu.is_available():
+    from .xpu.lowering import *

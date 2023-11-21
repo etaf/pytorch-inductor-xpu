@@ -90,6 +90,8 @@ def lazy_init():
 
         _mkldnn_fusion_init()
 
+    if torch.xpu.is_available():
+        from . import xpu_fusion
 
 def reorder_for_locality(graph: torch.fx.Graph):
     def visit(other_node):
