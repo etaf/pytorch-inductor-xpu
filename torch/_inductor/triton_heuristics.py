@@ -48,6 +48,7 @@ else:
     triton = None
     KernelInterface = object
 
+from intel_extension_for_pytorch._C import _getCurrentRawStream as get_xpu_stream
 if has_triton():
     from triton.runtime.jit import get_cuda_stream
 else:
@@ -143,6 +144,10 @@ class CachingAutotuner(KernelInterface):
         self.mutated_arg_names = mutated_arg_names
         self.configs = configs
         self.heuristic_type = heuristic_type
+        self.device_type = self.meta["device_type"]
+        self.torch_device = torch.cuda
+        if self.device_type == "xpu":
+            self.torch_device = torch.xpu
 
         if log.isEnabledFor(logging.DEBUG):
             log.debug("CachingAutotuner gets %d configs", len(self.configs))
@@ -189,7 +194,8 @@ class CachingAutotuner(KernelInterface):
         )
 
         # Setting device_type="hip" required on ROCm to pass down to triton
-        compile_meta["device_type"] = "cuda" if torch.version.hip is None else "hip"
+        # compile_meta["device_type"] = "cuda" if torch.version.hip is None else "hip"
+        compile_meta["device_type"] = self.meta["device_type"]
 
         if warm_cache_only_with_cc:
             triton.compile(
@@ -200,10 +206,13 @@ class CachingAutotuner(KernelInterface):
             )
             return
 
+        # torch_device = torch.cuda
+        # if compile_meta["device_type"] == "xpu":
+            # torch_device = torch.xpu
         # load binary to the correct device
-        with torch.cuda.device(compile_meta["device"]):
+        with self.torch_device.device(compile_meta["device"]):
             # need to initialize context
-            torch.cuda.synchronize(torch.cuda.current_device())
+            self.torch_device.synchronize(self.torch_device.current_device())
             binary = triton.compile(
                 self.fn,
                 **compile_meta,
@@ -223,8 +232,8 @@ class CachingAutotuner(KernelInterface):
             "grid_meta": cfg.kwargs,
             "bin": binary,
             "torch": torch,
-            "set_device": torch.cuda.set_device,
-            "current_device": torch.cuda.current_device,
+            "set_device": self.torch_device.set_device,
+            "current_device": self.torch_device.current_device,
         }
         exec(
             f"""
@@ -269,8 +278,10 @@ class CachingAutotuner(KernelInterface):
                 launcher.n_spills,
             )
             return float("inf")
-
-        stream = get_cuda_stream(torch.cuda.current_device())
+        get_device_stream = get_cuda_stream
+        if self.device_type == "xpu":
+            get_device_stream = get_xpu_stream
+        stream = get_device_stream(self.torch_device.current_device())
 
         def kernel_call():
             if launcher.config.pre_hook is not None:

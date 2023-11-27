@@ -1716,7 +1716,7 @@ class TritonKernel(Kernel):
     def codegen_kernel_benchmark(self):
         result = IndentedBuffer()
         argdefs, call_args, signature = self.args.python_argdefs()
-
+        device_type = V.graph.scheduler.current_device.type
         result.writelines(["", "", "def get_args():"])
         with result.indent():
             name_cnt = itertools.count()
@@ -1756,10 +1756,10 @@ class TritonKernel(Kernel):
         extra_args_str = None
         index = V.graph.scheduler.current_device.index
         with result.indent():
-            result.writeline(f"with torch.cuda._DeviceGuard({index}):")
+            result.writeline(f"with torch.{device_type}._DeviceGuard({index}):")
             with result.indent():
                 result.writeline(
-                    f"torch.cuda.set_device({index})"
+                    f"torch.{device_type}.set_device({index})"
                 )  # no-op to ensure context
                 for tree in self.range_trees:
                     expr = pexpr(V.graph.sizevars.size_hint(tree.numel))
@@ -1769,7 +1769,7 @@ class TritonKernel(Kernel):
                         grid.append(expr)
 
                 stream_name = f"stream{index}"
-                result.writeline(f"{stream_name} = get_cuda_stream({index})")
+                result.writeline(f"{stream_name} = get_device_stream({index})")
                 extra_args_str = ", ".join(map(str, extra_args)) + ", "
                 result.writeline(
                     f"KERNEL_NAME.run(*args, {extra_args_str}grid=grid({', '.join(grid)}), stream={stream_name})"
@@ -1778,10 +1778,10 @@ class TritonKernel(Kernel):
         # benchmark all configs
         result.writelines(["\n", "\n", "def benchmark_all_configs(args):"])
         with result.indent():
-            result.writeline(f"with torch.cuda._DeviceGuard({index}):")
+            result.writeline(f"with torch.{device_type}._DeviceGuard({index}):")
             with result.indent():
                 result.writeline(
-                    f"torch.cuda.set_device({index})"
+                    f"torch.{device_type}.set_device({index})"
                 )  # no-op to ensure context
                 result.writeline(
                     f"return KERNEL_NAME.benchmark_all_configs(*args, {extra_args_str}grid=grid({', '.join(grid)}))"
@@ -1841,11 +1841,11 @@ class TritonKernel(Kernel):
                 code.splice(
                     """
                         from torch._dynamo.testing import rand_strided
-                        from torch._C import _cuda_getCurrentRawStream as get_cuda_stream
+                        from {}._C import {}_getCurrentRawStream as get_device_stream
                         import torch
                         from torch._inductor.triton_heuristics import grid
-                    """
-                )
+                    """.format("intel_extension_for_pytorch" if device_type == 'xpu' else "torch",
+                        "" if device_type == 'xpu' else "_cuda"))
 
         argdefs, _, signature = self.args.python_argdefs()
         # maps actual expression to SizeArg if its in sizevars replacements
@@ -2483,10 +2483,11 @@ class TritonScheduling(BaseScheduling):
 
             basename, _, kernel_path = get_path(code_hash(src_code), "py")
 
+            device_type = V.graph.scheduler.current_device.type
             compile_wrapper = IndentedBuffer()
             compile_wrapper.writeline(f"async_compile.triton({subs_name!r}, '''")
             compile_wrapper.splice(src_code, strip=True)
-            compile_wrapper.writeline("''')")
+            compile_wrapper.writeline("''', \"{device_type}\")")
 
             metadata_comment = f"# kernel path: {kernel_path}"
             origins, detailed_origins = get_kernel_metadata(node_schedule, wrapper)
@@ -2519,7 +2520,8 @@ class TritonScheduling(BaseScheduling):
         self.scheduler.free_buffers()
 
     def codegen_sync(self):
-        V.graph.wrapper_code.writeline("torch.cuda.synchronize()")
+        device_type = V.graph.scheduler.current_device.type
+        V.graph.wrapper_code.writeline(f"torch.{device_type}.synchronize()")
 
     def codegen_foreach(self, foreach_node):
         from .triton_foreach import ForeachKernel

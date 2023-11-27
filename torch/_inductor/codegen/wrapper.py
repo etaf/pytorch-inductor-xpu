@@ -140,25 +140,48 @@ class MemoryPlanningState:
         self.reuse_pool[key].append(item)
 
 
+
 @dataclasses.dataclass
-class EnterCudaDeviceContextManagerLine:
+class EnterDeviceContextManagerLine:
+    device_type: str
     device_idx: int
     first_time: bool
 
-    def codegen(self, code: IndentedBuffer, device_cm_stack: contextlib.ExitStack):
+    def xpu_codegen(self, code: IndentedBuffer, device_cm_stack: contextlib.ExitStack):
+        if V.graph.cpp_wrapper:
+            raise NotImplementedError
+        else:
+            # Note _DeviceGuard has less overhead than device, but only accepts
+            # integers
+            code.writeline(f"with torch.xpu._DeviceGuard({self.device_idx}):")
+            device_cm_stack.enter_context(code.indent())
+            code.writeline(
+                f"torch.xpu.set_device({self.device_idx}) # no-op to ensure context"
+            )
+
+    def cuda_codegen(self, code: IndentedBuffer, device_cm_stack: contextlib.ExitStack):
         if V.graph.cpp_wrapper:
             code.writeline("\n")
             if V.graph.aot_mode:
                 # In AOT mode, we have a stream provided as a param. A stream is
                 # associated with a device, so we never expect the device to change.
-                assert self.first_time
                 # CUDAStreamGuard sets the stream and the device.
-                code.writeline(
-                    f"at::cuda::CUDAStreamGuard stream_guard("
-                    f"at::cuda::getStreamFromExternal(stream, {self.device_idx}));"
-                )
+                if self.last_seen_device_guard_index is None:
+                    if config.aot_inductor.abi_compatible:
+                        code.writeline(
+                            "AOTICudaStreamGuard stream_guard(stream, this->device_idx_);"
+                        )
+                    else:
+                        code.writeline(
+                            "at::cuda::CUDAStreamGuard stream_guard("
+                            + "at::cuda::getStreamFromExternal(stream, this->device_idx_));"
+                        )
+                else:
+                    assert (
+                        self.last_seen_device_guard_index == self.device_idx
+                    ), "AOTInductor only supports running on one CUDA device"
             else:
-                if self.first_time:
+                if self.last_seen_device_guard_index is None:
                     code.writeline(
                         f"at::cuda::CUDAGuard device_guard({self.device_idx});"
                     )
@@ -173,8 +196,13 @@ class EnterCudaDeviceContextManagerLine:
                 f"torch.cuda.set_device({self.device_idx}) # no-op to ensure context"
             )
 
+    def codegen(self, code: IndentedBuffer, device_cm_stack: contextlib.ExitStack):
+        if device_type == 'cuda':
+            return cuda_codegen(code, device_cm, contextlib.ExitStack)
+        else:
+            return xpu_codegen(code, device_cm, contextlib.ExitStack)
 
-class ExitCudaDeviceContextManagerLine:
+class ExitDeviceContextManagerLine:
     def codegen(self, code: IndentedBuffer, device_cm_stack: contextlib.ExitStack):
         if not V.graph.cpp_wrapper:
             device_cm_stack.close()
@@ -323,6 +351,8 @@ class WrapperCodeGen(CodeGen):
             f"""
                 from ctypes import c_void_p, c_long
                 import torch
+                #TODO remove this
+                import intel_extension_for_pytorch
                 import math
                 import random
                 import os
@@ -345,13 +375,16 @@ class WrapperCodeGen(CodeGen):
 
     @cache_on_self
     def write_triton_header_once(self):
+
+        device_type = V.graph.scheduler.current_device.type
         self.header.splice(
             """
             import triton
             import triton.language as tl
             from torch._inductor.triton_heuristics import grid, start_graph, end_graph
-            from torch._C import _cuda_getCurrentRawStream as get_cuda_stream
-            """
+            from {}._C import {}_getCurrentRawStream as get_device_stream
+            """.format("intel_extension_for_pytorch" if device_type == 'xpu' else "torch",
+                "" if device_type == 'xpu' else "_cuda")
         )
 
     def add_meta_once(self, meta):
@@ -393,7 +426,7 @@ class WrapperCodeGen(CodeGen):
         )
         with self.prefix.indent():
             if config.triton.debug_sync_graph:
-                self.prefix.writeline("torch.cuda.synchronize()")
+                self.prefix.writeline(f"torch.{device_type}.synchronize()")
             inp_len = len(V.graph.graph_inputs.keys())
             if inp_len != 0:
                 lhs = f"{', '.join(V.graph.graph_inputs.keys())}{'' if inp_len != 1 else ','}"
@@ -407,7 +440,7 @@ class WrapperCodeGen(CodeGen):
     def write_get_raw_stream(self, index):
         self.write_triton_header_once()
         name = f"stream{index}"
-        self.writeline(f"{name} = get_cuda_stream({index})")
+        self.writeline(f"{name} = get_device_stream({index})")
         return name
 
     def next_kernel_suffix(self):
@@ -415,12 +448,12 @@ class WrapperCodeGen(CodeGen):
 
     def codegen_device_guard_enter(self, device_idx):
         self.writeline(
-            EnterCudaDeviceContextManagerLine(device_idx, self.first_device_guard)
+            EnterDeviceContextManagerLine(self.device_type, device_idx, self.first_device_guard)
         )
         self.first_device_guard = False
 
     def codegen_device_guard_exit(self):
-        self.writeline(ExitCudaDeviceContextManagerLine())
+        self.writeline(ExitDeviceContextManagerLine())
 
     def generate_return(self, output_refs):
         if output_refs:
@@ -480,6 +513,7 @@ class WrapperCodeGen(CodeGen):
         result = IndentedBuffer()
         result.splice(self.header)
 
+        device_type = V.graph.scheduler.current_device.type
         out_names = V.graph.get_output_names()
         with contextlib.ExitStack() as stack:
             stack.enter_context(self.wrapper_call.indent())
@@ -511,8 +545,8 @@ class WrapperCodeGen(CodeGen):
                 elif isinstance(
                     line,
                     (
-                        EnterCudaDeviceContextManagerLine,
-                        ExitCudaDeviceContextManagerLine,
+                        EnterDeviceContextManagerLine,
+                        ExitDeviceContextManagerLine,
                     ),
                 ):
                     line.codegen(self.wrapper_call, device_cm_stack)
@@ -522,7 +556,7 @@ class WrapperCodeGen(CodeGen):
             output_refs = self.get_output_refs()
             self.mark_output_type()
             if config.triton.debug_sync_graph:
-                self.wrapper_call.writeline("torch.cuda.synchronize()")
+                self.wrapper_call.writeline(f"torch.{device_type}.synchronize()")
 
             if config.profile_bandwidth:
                 self.wrapper_call.writeline("end_graph()")
@@ -1091,6 +1125,7 @@ class CppWrapperCodeGen(WrapperCodeGen):
         self.prefix.writeline("}")
 
     def generate(self):
+
         if V.graph.aot_mode:
             self.codegen_model_constructor()
         self.write_wrapper_decl()
@@ -1423,6 +1458,7 @@ class CudaWrapperCodeGen(CppWrapperCodeGen):
             return super().define_kernel(name, kernel, metadata, cuda)
 
     def generate(self):
+
         self.prefix.writeline("\n")
         for kernel in self.src_to_kernel.values():
             self.prefix.writeline(f"static CUfunction {kernel} = nullptr;")

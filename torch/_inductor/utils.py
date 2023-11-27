@@ -93,8 +93,13 @@ def has_triton() -> bool:
             device_interface.is_available()
             and device_interface.Worker.get_device_properties().major >= 7
         )
+    def is_xpu_compatible_with_triton():
+        device_interface = get_interface_for_device("xpu")
+        return (
+            device_interface.is_available()
+        )
 
-    return is_cuda_compatible_with_triton() and has_triton_package()
+    return (is_cuda_compatible_with_triton() or is_xpu_compatible_with_triton) and has_triton_package()
 
 
 @functools.lru_cache(None)

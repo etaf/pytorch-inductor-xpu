@@ -155,13 +155,8 @@ class GraphLowering(torch.fx.Interpreter):
 
             register_backend_for_device("cuda", TritonScheduling, WrapperCodeGen)
 
-        if torch.xpu.is_available():
-            if get_scheduling_for_device("xpu") is None:
-                from .xpu.overrides import override_size_asserts
-                from .codegen.xpu.triton import XPUTritonScheduling
-                from .codegen.xpu.wrapper import XPUTritonWrapperCodeGen
-                override_size_asserts()
-                register_backend_for_device("xpu", XPUTritonScheduling, XPUTritonWrapperCodeGen)
+        if get_scheduling_for_device("xpu") is None:
+            register_backend_for_device("xpu", TritonScheduling, WrapperCodeGen)
 
 
     def __init__(
