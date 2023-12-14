@@ -818,6 +818,7 @@ class TritonKernel(Kernel):
         pid_cache=None,
         reduction_hint=ReductionHint.DEFAULT,
         min_elem_per_thread=0,
+        device_api_codegen
     ):
         if pid_cache is None:
             pid_cache = {}
@@ -836,6 +837,7 @@ class TritonKernel(Kernel):
         self.index_dtype: str = index_dtype
         self.min_elem_per_thread = min_elem_per_thread
         self.last_usage: Set[str] = set()
+        self.device_api_codegen = device_api_codegen
 
         self.persistent_reduction: bool = self.should_use_persistent_reduction()
         self.no_x_dim = (
@@ -1858,10 +1860,10 @@ class TritonKernel(Kernel):
         extra_args_str = None
         index = V.graph.scheduler.current_device.index
         with result.indent():
-            result.writeline(f"with torch.cuda._DeviceGuard({index}):")
+            result.writeline(f"with {self.device_api_codegen.codegen_device_guard(index)}:")
             with result.indent():
                 result.writeline(
-                    f"torch.cuda.set_device({index})"
+                    self.device_api_codegen.codegen_set_device(index)
                 )  # no-op to ensure context
                 for tree in self.range_trees:
                     expr = pexpr(V.graph.sizevars.size_hint(tree.numel))
@@ -1871,7 +1873,7 @@ class TritonKernel(Kernel):
                         grid.append(expr)
 
                 stream_name = f"stream{index}"
-                result.writeline(f"{stream_name} = get_cuda_stream({index})")
+                result.writeline(f"{stream_name} = get_raw_stream({index})")
 
                 if self.need_numel_args():
                     extra_args_str = ", ".join(map(str, extra_args)) + ", "
@@ -1885,10 +1887,10 @@ class TritonKernel(Kernel):
         # benchmark all configs
         result.writelines(["\n", "\n", "def benchmark_all_configs(args):"])
         with result.indent():
-            result.writeline(f"with torch.cuda._DeviceGuard({index}):")
+            result.writeline(f"with {self.device_api_codegen.codegen_device_guard(index)}:")
             with result.indent():
                 result.writeline(
-                    f"torch.cuda.set_device({index})"
+                    self.device_api_codegen.codegen_set_device(index)
                 )  # no-op to ensure context
                 result.writeline(
                     f"return {str(Placeholder.KERNEL_NAME)}.benchmark_all_configs(*args, {extra_args_str}grid=grid({', '.join(grid)}))"  # noqa: B950 line too long
@@ -1919,10 +1921,10 @@ class TritonKernel(Kernel):
         return textwrap.dedent(
             """
             from torch._dynamo.testing import rand_strided
-            from torch._C import _cuda_getCurrentRawStream as get_cuda_stream
+            {}
             import torch
             from torch._inductor.triton_heuristics import grid
-        """
+        """.format(self.device_api_codegen.codegen_import_get_raw_stream())
         )
 
     def codegen_kernel(self, name=None):
@@ -2266,10 +2268,24 @@ class TritonKernel(Kernel):
     def create_cse_var(self, *args, **kwargs):
         return TritonCSEVariable(*args, **kwargs)
 
+class DeviceApiCodeGen:
+    def codegen_sync():
+        V.graph.wrapper_code.writeline("torch.cuda.synchronize()")
+
+    def codegen_import_get_raw_stream(self):
+        return "from torch._C import _cuda_getCurrentRawStream as get_raw_stream"
+
+    def codegen_device_guard(self, device_idx):
+        return f"torch.cuda._DeviceGuard({device_idx})"
+
+    def codegen_set_device(self, device_idx):
+        return f"torch.cuda.set_device({device_idx})"
+
 
 class TritonScheduling(BaseScheduling):
     def __init__(self, scheduler):
         self.scheduler = scheduler
+        self.device_api_codegen = DeviceApiCodeGen()
 
     def group_fn(self, sizes):
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
@@ -2630,6 +2646,7 @@ class TritonScheduling(BaseScheduling):
             reduction_hint=reduction_hint_val,
             mutations=mutations,
             index_dtype=index_dtype,
+            device_api_codegen=self.device_api_codegen
         )
 
         self.codegen_node_schedule_with_kernel(node_schedule, kernel)
@@ -2775,7 +2792,7 @@ class TritonScheduling(BaseScheduling):
         self.scheduler.free_buffers()
 
     def codegen_sync(self):
-        V.graph.wrapper_code.writeline("torch.cuda.synchronize()")
+        V.graph.wrapper_code.writeline(self.device_api_codegen.codegen_sync())
 
     def codegen_foreach(self, foreach_node):
         from .triton_foreach import ForeachKernel
@@ -2974,6 +2991,7 @@ class TritonScheduling(BaseScheduling):
             reduction_hint=reduction_hint_val,
             mutations=mutations,
             index_dtype=index_dtype,
+            device_api_codegen=self.device_api_codegen
         )
 
         # empty last_usage. May cause more aggressive 'evict_last'. Should be fine.
