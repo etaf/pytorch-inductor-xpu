@@ -623,6 +623,11 @@ copy pasted in from VariableTypeEverything.cpp with appropriate substitutions.
       REDISPATCH_SIGNATURE,                         \
       POLICY)
 
+#define KERNEL_XPU(OP, POLICY) KERNEL(c10::DeviceType::XPU, OP, POLICY)
+
+#define KERNEL_XPU2(OP, OVERLOAD, POLICY) \
+  KERNEL2(c10::DeviceType::XPU, OP, OVERLOAD, POLICY)
+
 // KERNEL_PRIVATEUSEONE/KERNEL_PRIVATEUSEONE2/
 // KERNEL_DIFFERENT_REDISPATCH_SIGNATURE_PRIVATEUSEONE
 // registration for AutocastPrivateUse1
