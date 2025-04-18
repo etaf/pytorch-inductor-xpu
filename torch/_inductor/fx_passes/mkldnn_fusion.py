@@ -244,11 +244,7 @@ if torch._C._has_mkldnn:
     def _clamp_fusion(computation_call):
         return CallFunction(
             aten.clamp_max,
-            CallFunction(
-                aten.clamp_min,
-                computation_call,
-                KeywordArg("min")
-            ),
+            CallFunction(aten.clamp_min, computation_call, KeywordArg("min")),
             KeywordArg("max"),
         )
 
@@ -759,20 +755,31 @@ if torch._C._has_mkldnn:
             binary_attr = _binary_attr[binary_op]
             args_list = list(args)
             computation_args = [args_list[0], other] + args_list[1:-3] + [binary_attr]
-            if len(args_list) > 6:
-                if unary_attr is not None:
-                    computation_args += [
-                        1.0,
-                        unary_attr.op_name,
-                        unary_attr.scalars_attr,
-                        unary_attr.algorithm_attr,
-                    ]
-                else:
-                    computation_args += [1.0, None, [], None]
-            counters["inductor"]["mkldnn_conv_binary_unary_fusion_matcher_count"] += 1
-            counters["inductor"]["mkldnn_conv_binary_unary_fusion_matcher_nodes"] += (
-                len(match.nodes)
-            )
+            if computation_op is mkldnn._convolution_pointwise.default:
+                if len(args_list) > 6:
+                    if unary_attr is not None:
+                        computation_args += [
+                            1.0,
+                            unary_attr.op_name,
+                            unary_attr.scalars_attr,
+                            unary_attr.algorithm_attr,
+                        ]
+                    else:
+                        computation_args += [1.0, None, [], None]
+
+                counters["inductor"][
+                    "mkldnn_conv_binary_unary_fusion_matcher_count"
+                ] += 1
+                counters["inductor"][
+                    "mkldnn_conv_binary_unary_fusion_matcher_nodes"
+                ] += len(match.nodes)
+            elif computation_op is mkldnn._linear_pointwise.default:
+                counters["inductor"][
+                    "mkldnn_linear_binary_unary_fusion_matcher_count"
+                ] += 1
+                counters["inductor"][
+                    "mkldnn_linear_binary_unary_fusion_matcher_nodes"
+                ] += len(match.nodes)
             # Make sure the other is not an alias or mutation(fx side doesn't has such info).
             other.realize()
             if not _can_be_inplace(other) or other.data.shape != list(
@@ -861,9 +868,7 @@ if torch._C._has_mkldnn:
                 for call_fn in computation_call_fns
             ]
             for pattern, computation_op in zip(_clamp_patterns, computation_ops):
-                _register_clamp_fusion_lowering(
-                    pattern, computation_op, lowp_dtype
-                )
+                _register_clamp_fusion_lowering(pattern, computation_op, lowp_dtype)
             _leaky_relu_patterns = [
                 _unary_fusion_pattern(_leaky_relu_fusion, call_fn, 3, lowp_dtype)
                 for call_fn in computation_call_fns
@@ -887,49 +892,57 @@ if torch._C._has_mkldnn:
 
     def _register_inplace_fusion():
         binary_ops = [aten.add, ops.add]
-        inplace_fusion_op = mkldnn._convolution_pointwise_.binary
-        outplace_fusion_op = mkldnn._convolution_pointwise.binary
-        conv_call = _conv_call(users=1)
-        conv_op = computation_ops[0]
+        inplace_fusion_ops = [
+            mkldnn._convolution_pointwise_.binary,
+            mkldnn._linear_pointwise_.binary,
+        ]
+        outplace_fusion_ops = [
+            mkldnn._convolution_pointwise.binary,
+            mkldnn._linear_pointwise.binary,
+        ]
+        computation_call_fns = [_conv_call(users=1), _linear_call(users=1)]
         for binary_op in binary_ops:
-            binary_v1 = _binary_fusion_v1(conv_call, binary_op)
-            binary_unary_v1 = _combined_fusion(binary_v1, aten.relu)
-            _register_binary_unary_maybe_inplace_fusion_lowering(
-                binary_unary_v1,
-                conv_op,
-                binary_op,
-                inplace_fusion_op,
-                outplace_fusion_op,
-                other_index=0,
-                unary_attr=UnaryAttr("relu"),
-            )
-            _register_binary_unary_maybe_inplace_fusion_lowering(
-                binary_v1,
-                conv_op,
-                binary_op,
-                inplace_fusion_op,
-                outplace_fusion_op,
-                other_index=0,
-            )
-            binary_v2 = _binary_fusion_v2(conv_call, binary_op)
-            binary_unary_v2 = _combined_fusion(binary_v2, aten.relu)
-            _register_binary_unary_maybe_inplace_fusion_lowering(
-                binary_unary_v2,
-                conv_op,
-                binary_op,
-                inplace_fusion_op,
-                outplace_fusion_op,
-                other_index=1,
-                unary_attr=UnaryAttr("relu"),
-            )
-            _register_binary_unary_maybe_inplace_fusion_lowering(
-                binary_v2,
-                conv_op,
-                binary_op,
-                inplace_fusion_op,
-                outplace_fusion_op,
-                other_index=1,
-            )
+            for i in range(len(computation_call_fns)):
+                binary_v1 = _binary_fusion_v1(computation_call_fns[i], binary_op)
+                if computation_ops[i] is mkldnn._convolution_pointwise.default:
+                    binary_unary_v1 = _combined_fusion(binary_v1, aten.relu)
+                    _register_binary_unary_maybe_inplace_fusion_lowering(
+                        binary_unary_v1,
+                        computation_ops[i],
+                        binary_op,
+                        inplace_fusion_ops[i],
+                        outplace_fusion_ops[i],
+                        other_index=0,
+                        unary_attr=UnaryAttr("relu"),
+                    )
+                _register_binary_unary_maybe_inplace_fusion_lowering(
+                    binary_v1,
+                    computation_ops[i],
+                    binary_op,
+                    inplace_fusion_ops[i],
+                    outplace_fusion_ops[i],
+                    other_index=0,
+                )
+                binary_v2 = _binary_fusion_v2(computation_call_fns[i], binary_op)
+                if computation_ops[i] is mkldnn._convolution_pointwise.default:
+                    binary_unary_v2 = _combined_fusion(binary_v2, aten.relu)
+                    _register_binary_unary_maybe_inplace_fusion_lowering(
+                        binary_unary_v2,
+                        computation_ops[i],
+                        binary_op,
+                        inplace_fusion_ops[i],
+                        outplace_fusion_ops[i],
+                        other_index=1,
+                        unary_attr=UnaryAttr("relu"),
+                    )
+                _register_binary_unary_maybe_inplace_fusion_lowering(
+                    binary_v2,
+                    computation_ops[i],
+                    binary_op,
+                    inplace_fusion_ops[i],
+                    outplace_fusion_ops[i],
+                    other_index=1,
+                )
 
     def _register_binary_fusion():
         binary_ops = [aten.add, ops.add, aten.sub, ops.sub]
