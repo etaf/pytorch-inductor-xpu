@@ -2460,6 +2460,15 @@ class cutlass:
         os.environ.get("CUTLASS_EPILOGUE_FUSION", "0") == "1"
     )
 
+    # When fusing an epilogue into a CUTLASS GEMM, re-autotune the GEMM config
+    # together with the fused epilogue instead of reusing the config picked for
+    # the bare GEMM. The bare-GEMM winner is not necessarily optimal once an
+    # epilogue is fused. This only retunes once per fused GEMM (at the final
+    # epilogue-fusion codegen), so it is much cheaper than benchmark_epilogue_fusion.
+    retune_epilogue_fusion = (
+        os.environ.get("CUTLASS_RETUNE_EPILOGUE_FUSION", "0") == "1"
+    )
+
     # Whether to only use TMA-compatible kernels in CUTLASS
     cutlass_tma_only = False
 

@@ -2,15 +2,18 @@
 import copy
 import enum
 import functools
+import hashlib
 import logging
+import math
 import re
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 import torch
 import torch.utils._pytree as pytree
-from torch._inductor.autotune_process import TensorMeta
+from torch._inductor.autotune_process import CUTLASSBenchmarkRequest, TensorMeta
 from torch._inductor.codegen.cutlass.cache import maybe_fetch_ops
 from torch._inductor.codegen.wrapper import PythonWrapperCodegen
 from torch._inductor.runtime.runtime_utils import dynamo_timed
@@ -23,6 +26,7 @@ from ...config import cutlass as inductor_cutlass_config
 from ...ir import (
     Buffer,
     ChoiceCaller,
+    ComputedBuffer,
     CUTLASSTemplateBuffer,
     FixedLayout,
     FlexibleLayout,
@@ -35,8 +39,8 @@ from ...virtualized import V
 from ..common import IndentedBuffer
 from ..cuda import cuda_env
 from . import utils as cutlass_utils
-from .kernel import CUTLASSTemplateKernel
-from .python_evt import CutlassEVTCodegen, scaled_mm_evt
+from .kernel import CUTLASSTemplateCaller, CUTLASSTemplateKernel
+from .python_evt import CutlassEVTCodegen, MockCutlassHandler, scaled_mm_evt
 from .template import CUTLASSTemplate
 from .utils import (
     ACCUMULATOR_DTYPES,
@@ -1086,6 +1090,218 @@ class CUTLASSGemmTemplate(CUTLASSTemplate, ABC):
             log.debug("Not caching ops since filtered_ops_cache has reached size 50.")
         return ret_res
 
+    def retune_with_epilogue(
+        self,
+        template_buffer_node: CUTLASSTemplateBuffer,
+        epilogue_nodes: list[BaseSchedulerNode],
+    ) -> Callable[..., Any] | None:
+        """
+        Re-autotune the GEMM config with the fused epilogue.
+
+        The bare-GEMM autotuning picks the fastest standalone GEMM config, which
+        is not necessarily fastest once an epilogue is fused. This benchmarks each
+        candidate config (the same op/swizzle search space used during the initial
+        autotuning) rendered together with the fused epilogue and returns a
+        ``make_kernel_render`` closure bound to the best config. Returns ``None``
+        to fall back to the bare-GEMM winner when no candidate can be benchmarked.
+        """
+        ops = self.gen_ops()
+        if not ops:
+            return None
+
+        swizzles = inductor_cutlass_config.cutlass_max_profiling_swizzle_options
+        choices: list[CUTLASSTemplateCaller] = []
+        for name, op in ops:
+            if not self.supports_epilogue_fusion(op, self.device_type):
+                continue
+            for swizzle in swizzles:
+                choice = self._make_fused_choice(
+                    name, op, swizzle, template_buffer_node, epilogue_nodes
+                )
+                if choice is not None:
+                    choices.append(choice)
+
+        if not choices:
+            return None
+
+        # Reuse the standard autotuning subprocess pool to benchmark the fused
+        # candidates. CUTLASS kernels can corrupt the device context when they
+        # fail to launch, so they must be benchmarked out-of-process, exactly
+        # like the bare-GEMM autotuning does.
+        from ...autotune_process import (
+            benchmark_in_sub_process,
+            get_tuning_process_pool,
+        )
+        get_tuning_process_pool()
+        print("Retuning with epilogue fusion, benchmarking %d candidates..." % len(choices))
+        timings = benchmark_in_sub_process(choices)  # type: ignore[arg-type]
+
+        best_choice = min(timings, key=timings.get)  # type: ignore[arg-type]
+        if not math.isfinite(timings[best_choice]):
+            return None
+        return best_choice.make_kernel_render
+
+    def _render_fused_kernel(
+        self,
+        kernel: CUTLASSTemplateKernel,
+        op: "cutlass_gemm_op.GemmOperation",  # type: ignore[name-defined]  # noqa: F821
+        swizzle: int,
+        template_buffer_node: CUTLASSTemplateBuffer,
+        epilogue_nodes: list[BaseSchedulerNode],
+    ) -> str:
+        """
+        Render the C++ source for the GEMM ``op`` fused with ``epilogue_nodes``.
+
+        Mirrors the epilogue setup done in ``CUTLASSScheduling.codegen_template``
+        (minus ``mark_run``/memory planning side effects) so the benchmarked
+        kernel matches the kernel that would actually be generated.
+        """
+        epilogue_ir_nodes: list[Buffer] = [n.node for n in epilogue_nodes]  # type: ignore[misc]
+        with kernel:
+            template_buffer_node.emulate_store_fn()
+            for node in epilogue_ir_nodes:
+                if not isinstance(node, ComputedBuffer):
+                    raise AssertionError(f"expected ComputedBuffer, got {type(node)}")
+                with V.set_ops_handler(MockCutlassHandler(V.get_ops_handler())):
+                    node.get_store_function()(CutlassEVTCodegen.get_index_vars(node))
+
+        with V.set_kernel_handler(kernel):
+            return self.render(
+                kernel=kernel,
+                op=op,
+                template_buffer_node=template_buffer_node,
+                epilogue_nodes=epilogue_nodes,
+                swizzle=swizzle,
+            )
+
+    def _make_fused_choice(
+        self,
+        name: str,
+        op: "cutlass_gemm_op.GemmOperation",  # type: ignore[name-defined]  # noqa: F821
+        swizzle: int,
+        template_buffer_node: CUTLASSTemplateBuffer,
+        epilogue_nodes: list[BaseSchedulerNode],
+    ) -> CUTLASSTemplateCaller | None:
+        """
+        Render the fused kernel for ``op``/``swizzle`` and wrap it in a
+        ``CUTLASSTemplateCaller`` so it can be benchmarked through the standard
+        autotuning subprocess pool. Returns ``None`` if the op cannot be
+        rendered or has a signature that is not benchmarkable here (e.g.
+        multiple outputs).
+        """
+        kernel = CUTLASSTemplateKernel(
+            kernel_name=str(Placeholder.KERNEL_NAME),
+            runtime_arg_info=self.get_runtime_arg_info(),
+            runtime_arg_values=self.get_runtime_arg_values(swizzle=swizzle),
+            device_type=self.device_type,
+        )
+        try:
+            code = self._render_fused_kernel(
+                kernel, op, swizzle, template_buffer_node, epilogue_nodes
+            )
+        except NotImplementedError:
+            return None
+        except Exception as e:
+            log.debug(
+                "retune_epilogue_fusion: render failed for %s swizzle=%s: %s",
+                op.configuration_name(),
+                swizzle,
+                e,
+            )
+            return None
+
+        # named_nodes can map several arg names to the same physical buffer
+        # (e.g. the EVT "D" output and "Y" both alias the fused output), so
+        # dedup by buffer name to recover the distinct pointer arguments.
+        input_nodes = list(
+            {
+                node.get_name(): node
+                for node in kernel.named_nodes.values()
+                if node.get_name() in kernel.args.input_buffers
+            }.values()
+        )
+        output_nodes = list(
+            {
+                node.get_name(): node
+                for node in kernel.named_nodes.values()
+                if node.get_name() in kernel.args.output_buffers
+            }.values()
+        )
+        # The benchmark request runs the kernel with a single output tensor, so
+        # skip configs whose fused signature writes multiple outputs.
+        if len(output_nodes) != 1:
+            return None
+
+        input_tensor_meta = TensorMeta.from_irnodes(input_nodes)  # type: ignore[arg-type]
+        output_tensor_meta = TensorMeta.from_irnodes(output_nodes[0])  # type: ignore[arg-type]
+
+        size_args = V.graph.sizevars.optimization_hints(kernel.get_dynamic_shape_args())
+        offset_args = V.graph.sizevars.optimization_hints(kernel.get_offset_args())
+        extra_args = tuple(
+            list(size_args)
+            + list(offset_args)
+            + self.get_runtime_arg_values(swizzle=swizzle)
+        )
+
+        kernel_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()[:8]
+        kernel_name = f"cutlass_{kernel_hash}"
+        code = code.replace(self.name, kernel_name)
+
+        bmreq = CUTLASSBenchmarkRequest(
+            kernel_name=kernel_name,
+            input_tensor_meta=input_tensor_meta,
+            output_tensor_meta=output_tensor_meta,
+            extra_args=extra_args,
+            source_code=code,
+            device_type=self.device_type,
+        )
+
+        return CUTLASSTemplateCaller(
+            kernel_name,
+            "cutlass_gemm",
+            self.input_nodes,
+            self.output_node.get_layout(),
+            self._make_fused_kernel_render(op, swizzle),
+            bmreq,
+            True,  # supports_epilogue_fusion
+            self,
+            {"op": op, "swizzle": swizzle},
+            f"{name} swizzle={swizzle} (epilogue-fused)",
+        )
+
+    def _make_fused_kernel_render(
+        self,
+        op: "cutlass_gemm_op.GemmOperation",  # type: ignore[name-defined]  # noqa: F821
+        swizzle: int,
+    ) -> Callable[..., Any]:
+        """
+        Build a ``make_kernel_render`` closure bound to ``op``/``swizzle``,
+        matching the closure produced by ``CUTLASSTemplate.generate`` so it can
+        replace ``CUTLASSTemplateBuffer.make_kernel_render`` for final codegen.
+        """
+
+        def make_kernel_render(
+            template_node: CUTLASSTemplateBuffer,
+            epilogue_nodes: list[BaseSchedulerNode] | None = None,
+        ) -> tuple[CUTLASSTemplateKernel, functools.partial]:
+            kernel = CUTLASSTemplateKernel(
+                kernel_name=str(Placeholder.KERNEL_NAME),
+                runtime_arg_info=self.get_runtime_arg_info(),
+                runtime_arg_values=self.get_runtime_arg_values(swizzle=swizzle),
+                device_type=self.device_type,
+            )
+            render = functools.partial(
+                self.render,
+                kernel=kernel,
+                template_buffer_node=template_node,
+                epilogue_nodes=epilogue_nodes,
+                op=op,
+                swizzle=swizzle,
+            )
+            return kernel, render
+
+        return make_kernel_render
+
     def gemm_mode(self) -> str:
         """
         Returns a Cutlass GEMM mode string for the current operation, dependent on whether this op implements
@@ -1744,8 +1960,12 @@ class CUTLASS3xGemmTemplate(CUTLASSGemmTemplate):
             raise RuntimeError("Invalid Gemm config: \n" + op_def)
         op_type = match.groups()[0]
         if op.gemm_kind == cutlass_lib.GemmKind.Universal3x:
-            op_def += f"\n  using {op_type}_device_type = cutlass::gemm::device::GemmUniversalAdapter<{op_type}>;\n"
-            op_type = f"{op_type}_device_type"
+            # op_def += f"\n  using {op_type}_device_type = cutlass::gemm::device::GemmUniversalAdapter<{op_type}>;\n"
+            # op_type = f"{op_type}_device_type"
+            unique_op_type = f"{op_type}_{Placeholder.KERNEL_NAME}"
+            op_def = op_def.replace(f"struct {op_type} :", f"struct {unique_op_type} :")
+            op_def += f"\n  using {unique_op_type}_device_type = cutlass::gemm::device::GemmUniversalAdapter<{unique_op_type}>;\n"
+            op_type = f"{unique_op_type}_device_type"
 
         return op_def, op_type
 

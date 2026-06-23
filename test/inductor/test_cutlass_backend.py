@@ -2465,6 +2465,63 @@ class TestCutlassBackend(TestCase):
 
     @skipXPUIf(not Xe2_Or_Later, "")
     @skipCUDAIf(not SM90OrLater, "need sm_90")
+    @use_evt_config
+    @config.patch(
+        {
+            "cutlass.retune_epilogue_fusion": True,
+            # Profile more than one config so the epilogue retune has a
+            # non-trivial search space to pick from.
+            "cutlass.cutlass_max_profiling_configs": 2,
+        }
+    )
+    def test_evt_gelu_retune(self):
+        # With retune_epilogue_fusion enabled, the GEMM config is re-autotuned
+        # together with the fused epilogue (instead of reusing the bare-GEMM
+        # winner). This verifies the retune hook actually fires and selects a
+        # fused config.
+        from torch._inductor.codegen.cutlass.gemm_template import CUTLASSGemmTemplate
+
+        torch._dynamo.utils.counters.clear()
+
+        class TestModel(torch.nn.Module):
+            def forward(self, a, b):
+                return torch.nn.functional.gelu(a @ b)
+
+        M = 10240
+        N = 512
+        a = torch.randn(M, N).to(GPU_TYPE).half()
+        b = torch.randn(N, N).to(GPU_TYPE).half().t()
+        model = TestModel().to(GPU_TYPE)
+
+        orig_retune = CUTLASSGemmTemplate.retune_with_epilogue
+        retune_results = []
+
+        def spy_retune(self, template_buffer_node, epilogue_nodes):
+            render = orig_retune(self, template_buffer_node, epilogue_nodes)
+            retune_results.append(render)
+            return render
+
+        with mock.patch.object(
+            CUTLASSGemmTemplate,
+            "retune_with_epilogue",
+            autospec=True,
+            side_effect=spy_retune,
+        ):
+            result = torch.compile(model)(a, b)
+        ref_result = model(a, b)
+
+        # The retune hook fired during epilogue-fusion codegen ...
+        self.assertGreaterEqual(len(retune_results), 1)
+        # ... and actually selected a fused config (non-None render closure).
+        self.assertTrue(any(render is not None for render in retune_results))
+        self.assertEqual(
+            torch._dynamo.utils.counters["inductor"]["cutlass_epilogue_fusion_counter"],
+            1,
+        )
+        torch.testing.assert_close(result, ref_result, atol=1e-2, rtol=1e-2)
+
+    @skipXPUIf(not Xe2_Or_Later, "")
+    @skipCUDAIf(not SM90OrLater, "need sm_90")
     @xfailIfSM120OrLater
     @use_evt_config
     @evt_all_ops

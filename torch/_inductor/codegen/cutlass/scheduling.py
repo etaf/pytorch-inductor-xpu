@@ -167,7 +167,17 @@ class CUTLASSScheduling(BaseScheduling):
             raise AssertionError(
                 "Epilogue nodes must all be instances of ir.ComputedBuffer"
             )
-        kernel, render = ctb.make_kernel_render(  # type: ignore[misc]
+        make_kernel_render = ctb.make_kernel_render
+        if (
+            config.cutlass.retune_epilogue_fusion
+            and epilogue_nodes
+            and ctb.supports_epilogue_fusion
+            and hasattr(ctb.template, "retune_with_epilogue")
+        ):
+            retune_render = ctb.template.retune_with_epilogue(ctb, epilogue_nodes)
+            if retune_render is not None:
+                make_kernel_render = retune_render
+        kernel, render = make_kernel_render(  # type: ignore[misc]
             ctb, epilogue_nodes=epilogue_nodes
         )
         with kernel:
