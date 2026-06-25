@@ -3889,6 +3889,13 @@ def _classify_kernel_operation(
     return "other"
 
 
+def _choice_debug_id(choice: ChoiceCaller) -> str:
+    bmreq = getattr(choice, "bmreq", None)
+    if bmreq is None:
+        return choice.name
+    return f"{choice.name} [{bmreq.hash_key[:16]}]"
+
+
 class AlgorithmSelectorCache(PersistentCache):
     """
     A persistent cache for algorithm selection results used in autotuning of GEMMs
@@ -4565,6 +4572,42 @@ class AlgorithmSelectorCache(PersistentCache):
             )
 
         return timings
+
+    def prescreen_runtime_param_choices(
+        self,
+        choices: list[ChoiceCaller],
+        name: str,
+        inputs_key: str,
+        *,
+        precompile_fn: Callable[[], dict[ChoiceCaller, float]] | None = None,
+    ) -> tuple[list[ChoiceCaller], float | None, int]:
+        candidates = self.prescreen_choices(
+            choices, name, inputs_key, self.prescreening_cache
+        )
+        if not candidates:
+            return choices, None, len(candidates)
+
+        from . import autotune_process
+
+        prescreening_start_ts = time.time()
+        if precompile_fn is not None:
+            precompile_fn()
+            candidates = [c for c in candidates if not c.failed]
+            if not candidates:
+                return [], time.time() - prescreening_start_ts, 0
+        timings = self.lookup(
+            candidates,
+            name,
+            inputs_key,
+            lambda choices: autotune_process.benchmark_in_sub_process(list(choices)),  # type: ignore[arg-type]
+        )
+        return (
+            self.prune_choices_postscreen(
+                choices, timings, name, inputs_key, self.prescreening_cache
+            ),
+            time.time() - prescreening_start_ts,
+            len(candidates),
+        )
 
     def create_no_valid_choices(self, name: str, reason: str) -> NoValidChoicesError:
         backend_config = (
@@ -5445,7 +5488,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 result = candidate_timings[choice]
                 if result:
                     lines.append(
-                        f"  {choice.name} {result:.4f} ms {best_time / result:.1%} {choice.description}"
+                        f"  {_choice_debug_id(choice)} {result:.4f} ms {best_time / result:.1%} {choice.description}"
                     )
                 else:
                     lines.append(
@@ -5806,7 +5849,7 @@ class AlgorithmSelectorCache(PersistentCache):
             if result:
                 kernel_description = choice.description
                 sys.stderr.write(
-                    f"  {choice.name} {result:.4f} ms {best_time / result:.1%} {kernel_description}\n"
+                    f"  {_choice_debug_id(choice)} {result:.4f} ms {best_time / result:.1%} {kernel_description}\n"
                 )
             else:
                 sys.stderr.write(

@@ -2494,24 +2494,98 @@ class TestCutlassBackend(TestCase):
         model = TestModel().to(GPU_TYPE)
 
         orig_retune = CUTLASSGemmTemplate.retune_with_epilogue
+        orig_prescreen = torch._inductor.select_algorithm.AlgorithmSelectorCache.prescreen_runtime_param_choices
+        orig_log_results = torch._inductor.select_algorithm.AlgorithmSelectorCache.log_results
         retune_results = []
+        prescreened_choice_counts = []
+        log_results_calls = []
 
         def spy_retune(self, template_buffer_node, epilogue_nodes):
             render = orig_retune(self, template_buffer_node, epilogue_nodes)
             retune_results.append(render)
             return render
 
-        with mock.patch.object(
-            CUTLASSGemmTemplate,
-            "retune_with_epilogue",
-            autospec=True,
-            side_effect=spy_retune,
+        def spy_prescreen(self, choices, name, inputs_key, **kwargs):
+            assert name == "cutlass_epilogue_fusion_retune"
+            pruned_choices, prescreening_elapse, prescreen_candidate_count = orig_prescreen(
+                self, choices, name, inputs_key, **kwargs
+            )
+            prescreened_choice_counts.append(
+                (len(choices), len(pruned_choices), prescreen_candidate_count)
+            )
+            return pruned_choices, prescreening_elapse, prescreen_candidate_count
+
+        def spy_log_results(
+            name,
+            input_nodes,
+            timings,
+            elapse,
+            precompile_elapse,
+            prescreening_elapse=None,
+            hint_override=None,
+            is_collective=False,
         ):
-            result = torch.compile(model)(a, b)
+            if name == "cutlass_epilogue_fusion_retune":
+                log_results_calls.append(
+                    {
+                        "name": name,
+                        "num_choices": len(timings),
+                        "prescreening_elapse": prescreening_elapse,
+                    }
+                )
+            return orig_log_results(
+                name,
+                input_nodes,
+                timings,
+                elapse,
+                precompile_elapse,
+                prescreening_elapse=prescreening_elapse,
+                hint_override=hint_override,
+                is_collective=is_collective,
+            )
+
+        with fresh_cache():
+            with mock.patch.object(
+                CUTLASSGemmTemplate,
+                "retune_with_epilogue",
+                autospec=True,
+                side_effect=spy_retune,
+            ), mock.patch.object(
+                torch._inductor.select_algorithm.AlgorithmSelectorCache,
+                "prescreen_runtime_param_choices",
+                autospec=True,
+                side_effect=spy_prescreen,
+            ), mock.patch.object(
+                torch._inductor.select_algorithm.AlgorithmSelectorCache,
+                "log_results",
+                autospec=True,
+                side_effect=spy_log_results,
+            ):
+                result = torch.compile(model)(a, b)
         ref_result = model(a, b)
 
         # The retune hook fired during epilogue-fusion codegen ...
         self.assertGreaterEqual(len(retune_results), 1)
+        self.assertGreaterEqual(len(prescreened_choice_counts), 1)
+        # The fused retune path runs the CUTLASS prescreen helper before the
+        # final benchmark. Small test search spaces can legitimately skip the
+        # actual pruning stage because prescreening only kicks in once enough
+        # swizzle=2 candidates are present.
+        self.assertTrue(
+            all(pruned <= total for total, pruned, _ in prescreened_choice_counts)
+        )
+        self.assertEqual(len(log_results_calls), 1)
+        self.assertGreater(log_results_calls[0]["num_choices"], 0)
+        if any(pruned < total for total, pruned, _ in prescreened_choice_counts):
+            self.assertIsNotNone(log_results_calls[0]["prescreening_elapse"])
+            self.assertTrue(
+                any(prescreened > 0 for _, _, prescreened in prescreened_choice_counts)
+            )
+        else:
+            self.assertIsNone(log_results_calls[0]["prescreening_elapse"])
+            self.assertTrue(
+                all(prescreened == 0 for _, _, prescreened in prescreened_choice_counts)
+            )
         # ... and actually selected a fused config (non-None render closure).
         self.assertTrue(any(render is not None for render in retune_results))
         self.assertEqual(

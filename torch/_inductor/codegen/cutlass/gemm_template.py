@@ -18,7 +18,10 @@ from torch._inductor.codegen.cutlass.cache import maybe_fetch_ops
 from torch._inductor.codegen.wrapper import PythonWrapperCodegen
 from torch._inductor.runtime.runtime_utils import dynamo_timed
 from torch._inductor.scheduler import BaseSchedulerNode
-from torch._inductor.select_algorithm import create_inputs_key
+from torch._inductor.select_algorithm import (
+    create_inputs_key,
+    get_algorithm_selector_cache,
+)
 from torch._inductor.utils import clear_on_fresh_cache
 
 from ... import ir
@@ -1124,6 +1127,32 @@ class CUTLASSGemmTemplate(CUTLASSTemplate, ABC):
         if not choices:
             return None
 
+        algorithm_selector_cache = get_algorithm_selector_cache()
+        precompile_start_ts = time.time()
+        precompile_fn = algorithm_selector_cache.make_precompile_fn(
+            choices,
+            "cutlass_epilogue_fusion_retune",
+            self.cache_key,
+        )
+        precompile_fn()
+        precompile_elapse = time.time() - precompile_start_ts
+        precompile_key = getattr(precompile_fn, "precompile_key", None)
+        choices = [c for c in choices if not c.failed]
+        if not choices:
+            if precompile_key is not None:
+                algorithm_selector_cache.precompile_cache.pop(precompile_key, None)
+            return None
+
+        pre_prescreen_choice_count = len(choices)
+        choices, prescreening_elapse, prescreen_candidate_count = (
+            algorithm_selector_cache.prescreen_runtime_param_choices(
+                choices,
+                "cutlass_epilogue_fusion_retune",
+                self.cache_key,
+                precompile_fn=precompile_fn,
+            )
+        )
+
         # Reuse the standard autotuning subprocess pool to benchmark the fused
         # candidates. CUTLASS kernels can corrupt the device context when they
         # fail to launch, so they must be benchmarked out-of-process, exactly
@@ -1133,8 +1162,34 @@ class CUTLASSGemmTemplate(CUTLASSTemplate, ABC):
             get_tuning_process_pool,
         )
         get_tuning_process_pool()
-        print("Retuning with epilogue fusion, benchmarking %d candidates..." % len(choices))
-        timings = benchmark_in_sub_process(choices)  # type: ignore[arg-type]
+        if prescreen_candidate_count:
+            print(
+                "Retuning with epilogue fusion, prescreened %d candidates and benchmarking %d/%d fused candidates..."
+                % (
+                    prescreen_candidate_count,
+                    len(choices),
+                    pre_prescreen_choice_count,
+                )
+            )
+        else:
+            print(
+                "Retuning with epilogue fusion, benchmarking %d/%d fused candidates (prescreen skipped)..."
+                % (len(choices), pre_prescreen_choice_count)
+            )
+        benchmark_start_ts = time.time()
+        try:
+            timings = benchmark_in_sub_process(choices)  # type: ignore[arg-type]
+            algorithm_selector_cache.log_results(
+                "cutlass_epilogue_fusion_retune",
+                self.input_nodes,
+                timings,
+                time.time() - benchmark_start_ts,
+                precompile_elapse,
+                prescreening_elapse=prescreening_elapse,
+            )
+        finally:
+            if precompile_key is not None:
+                algorithm_selector_cache.precompile_cache.pop(precompile_key, None)
 
         best_choice = min(timings, key=timings.get)  # type: ignore[arg-type]
         if not math.isfinite(timings[best_choice]):
